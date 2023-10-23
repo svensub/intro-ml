@@ -1,0 +1,467 @@
+---
+title: "Introduction to Machine Learning Assessment"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r include=FALSE}
+
+# installing relevant packages
+cran.packages<-c("caret","tidyverse","rpart","rpart.plot","party",
+                 "randomForest","e1071","Rtsne","dbscan","C50","UpSetR",
+                 "RColorBrewer","GGally","ggfortify","reshape2","plyr",
+                 "corrplot","pROC","scatterplot3d","devtools","dendextend", 
+                 "magrittr","cluster", "gplots","methods","class","datasets", 
+                 "caTools","ggplot2","ggdendro","doParallel","devtools",
+                 "mlbench","plot3D","ROCR","UsingR","rafalib","downloader",
+                 "lattice","stepPlr","arm","kernlab","nnet","neuralnet",
+                 "MASS", "NeuralNetTools","ISLR", "boot","faraway","CVST",                    "readr", "pheatmap", "cluster")
+
+bioconductor.packages<-c("EBImage")
+
+# CRAN packages
+new.packages <- cran.packages[!(cran.packages %in% 
+                                installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+
+# bioconductor packages
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install()
+new.bio.packages<-bioconductor.packages[!(bioconductor.packages 
+                                         %in% installed.packages()[,"Package"])]
+if(length(new.bio.packages)) BiocManager::install(new.bio.packages)
+
+# packages from other repositories
+devtools::install_github("SheffieldML/vargplvm/vargplvmR")
+devtools::install_github("ManchesterBioinference/DEtime")
+
+# set working directory
+setwd("file path")
+```
+
+This analysis explores two machine learning (ML) methods, random forests (RF) and support vector machines (SVMs), on single-cell RNA-seq data on 1000 genes. This analysis describes and comments on the pre-processing summaries required for the methods, the stability of each method using both default and alternative hyper-parameters, and chosen discriminative features. The analysis concludes with a discussion on model appropriateness from both a supervised and unsupervised angle.
+
+```{r include = FALSE}
+# load relevant packages
+library(caret)
+library(ggplot2); theme_set(theme_bw())
+library(UpSetR)
+library(GGally)
+library(rpart.plot)
+library(Rtsne)
+library(dplyr)
+library(randomForest)
+library(pheatmap)
+library(cluster)
+```
+
+```{r}
+# load data
+cuomo = read.csv('Cuomo2020_ML_7.csv',row.names = 1)
+cuomoData = cuomo[,colnames(cuomo)[colnames(cuomo)!='classification']]
+cuomoClass = cuomo$type
+```
+
+## Pre-processing summaries
+
+The relevant pre-processing summaries for both classification methods explored in this analysis include:
+
+#### 1) Removing highly correlated, zero and near-zero variance variables
+
+We first clean the data set, and transform all integer observations to numeric (which allows us to find the highly correlated variables). We also remove the columns with text (i.e., donor and type). Thirdly, we remove any columns with all 0 observations (i.e., removing zero variables); zero variance variables can cause problems with cross validation and we want to avoid errors occurring in the fitting process.
+
+```{r}
+cuomoData[] <- lapply(cuomoData, function(x) {if(is.integer(x)) as.numeric(x) 
+               else x}) 
+# convert int variables to num
+
+cuomoData <- cuomoData[,-c(1001,1002)] # remove last two columns for cleaning
+
+cuomoData <- cuomoData[, colSums(abs(cuomoData)) != 0] # remove columns with all 0 vals
+
+corMat <- cor(cuomoData)
+highCorr <- findCorrelation(corMat, cutoff=0.5)
+highly.correlated = names(cuomoData)[highCorr]
+print(head(highly.correlated))
+nzv <- nearZeroVar(cuomoData, saveMetrics=T)
+near.zero.variance = rownames(nzv[nzv$nzv==TRUE | nzv$zeroVar==TRUE,])
+print(head(near.zero.variance))
+features.to.exclude = unique(c(highly.correlated,near.zero.variance))
+print(length(features.to.exclude))
+cuomoData = cuomoData[,!(colnames(cuomoData)%in%features.to.exclude)]
+```
+
+To find highly correlated variables, we set a cutoff of 0.5, which means all genes and features that have a correlation larger than 0.5 are excluded from the analyses. 
+
+We have also removed near zero variance variables, as there is very little information in these variables. We want to reduce model-fitting time without reducing model accuracy, and low variance variables are unlikely to have a large effect on the model. We inspect all the genes we have excluded.
+
+#### 2) Splitting the dataset into training and test sets
+
+We divide our data into a training and test set (with a 70-30 split). Given the assumption that the data set is normalized (i.e. the distributions of expression levels are comparable across cells and no technical biases are present), this helps us assess whether the model is overfitting to the data.
+
+```{r}
+set.seed(42)
+trainIndex <- createDataPartition(y=cuomoClass, times=1, p=0.7, list=F)
+classTrain <- as.factor(cuomoClass[trainIndex])
+dataTrain <- cuomoData[trainIndex,]
+classTest <- as.factor(cuomoClass[-trainIndex])
+dataTest <- cuomoData[-trainIndex,]
+```
+
+## Random Forest
+
+Random Forest is a type of ensemble learning method that combines a range of weak models to create a strong model. After pre-processing (as described above), we can set up cross-validation. For the RF classification method, a 10-fold cross-validation has been set up, and seeds have been set.
+
+```{r}
+set.seed(42)
+seeds <- vector(mode = "list", length = 11)
+for(i in 1:10) seeds[[i]] <- sample.int(1000, 25)
+seeds[[11]] <- sample.int(1000,1)
+
+train_ctrl <- trainControl(method="cv",
+                           number = 10,
+                           preProcOptions=list(cutoff=0.75),
+                           seeds = seeds)
+```
+
+### Random Forest: default hyper-parameters
+
+For RF, the caret package is used. The default hyper-parameter used for for random forest is mtry. Additionally, we centre and scale (i.e., standardisation) as the gene expression levels may have different ranges.
+
+```{r}
+rfFit <- train(dataTrain, classTrain,
+               method="rf",
+               preProcess = c("center", "scale"),
+               tuneLength=10,
+               trControl=train_ctrl)
+rfFit
+```
+
+Peak accuracy and kappa is achieved at mtry = 38. This is illustrated quite clearly in the figure below.
+
+```{r}
+plot(rfFit)
+```
+
+```{r}
+test_pred <- predict(rfFit, dataTest)
+confusionMatrix(test_pred, classTest)
+```
+
+When looking at the test dataset, we can see very good predictions for class 1 and 2, but some variability for class 3. We can think about perhaps using RF as a classifier for predicting certain classes (i.e., 1 and 2), and possibly using other classifiers for class 3, thereby combining classifiers to get more out of the data.
+
+### Random Forest: discriminative features
+
+Using the varImp function, we extract some discriminative features. 
+
+```{r}
+rfFeat = varImp(rfFit)$importance
+rfFeat$gene = rownames(rfFeat)
+rfFeatures = head(rfFeat[order(-rfFeat$Overall),]$gene,10)
+print(rfFeatures)
+varImpPlot(rfFit$finalModel,n.var = 10)
+```
+
+Looking at the plot for variable importance, we see that the top three discriminative features are TSPYL1, SPATS2L and NAMPT, but the other discriminative features follow closely behind, with observed patterns of ranking as well as a plateau.
+
+#### Training on top 10 discriminative features
+
+Running the RF on a reduced model (i.e., 10 most discriminative features) can yield insights. We only have 351 samples and 10 predictors. 
+
+```{r}
+dataTrain_topfeat = dataTrain[,rfFeatures]
+dataTest_topfeat = dataTest[,rfFeatures]
+rfFit_topfeat <- train(dataTrain_topfeat, classTrain,
+                       method="rf",
+                       tuneLength=10,
+                       trControl=train_ctrl)
+rfFit_topfeat
+```
+
+We notice that accuracy and kappa peak at mtry = 2. 
+
+```{r}
+test_pred <- predict(rfFit_topfeat, dataTest_topfeat)
+confusionMatrix(test_pred, classTest)
+```
+
+Looking at the confusion matrix, we can see a worse result compared to training the full data set. Predictions for class 1 are a lot worse, and predictions for class 3 are just as poor as the full data set. 
+
+### Random Forest: optimizing hyper-parameters
+
+We attempt to optimize another hyper-parameter, ntree. To decide how many trees to use, we build 500 decision trees using randomForest and plot the variation in the error rate by the number of trees.
+
+```{r}
+rf_ntree <- randomForest(dataTrain,
+                         classTrain,
+                         ntree=500,
+                         importance=T)
+
+error.rates=as.data.frame(rf_ntree$err.rate)
+error.rates$ntree=as.numeric(rownames(error.rates))
+error.rates.melt=reshape2::melt(error.rates,id.vars=c('ntree'))
+ggplot(error.rates.melt,aes(x=ntree,y=value,color=variable))+geom_line()
+```
+
+The plot shows that for the 1st and 2nd classes, between 100 and 150 trees onwards, we do not necessarily require more trees to capture the characteristics of the classes. For the 3rd class however, the error rate stabilizes only after 200 or so trees. There also seems to be a lot of noise for class 3 compared to class 1 and 2. Based on this, we can tune the number of decision trees to 200 using caret.
+
+```{r}
+rfFit2 <- train(dataTrain, classTrain,
+                method="rf",
+                preProcess = c("center", "scale"),
+                ntree = 200,
+                tuneLength=10,
+                trControl=train_ctrl)
+rfFit2
+```
+
+Peak accuracy and kappa is achieved at mtry = 112. 
+
+```{r}
+test_pred <- predict(rfFit2, dataTest)
+confusionMatrix(test_pred, classTest)
+```
+
+We can see very good predictions for class 1 and 2, but some variability for class 3. Compared to the first RF model, this model seems to make better predictions. 
+
+We similarly extract discriminative features for this model.
+
+```{r}
+rfFeat2 = varImp(rfFit2)$importance
+rfFeat2$gene = rownames(rfFeat2)
+rfFeatures2 = head(rfFeat2[order(-rfFeat2$Overall),]$gene,10)
+print(rfFeatures2)
+varImpPlot(rfFit2$finalModel,n.var = 10)
+```
+
+The plot for variable importance shows that the top discriminative feature is SLC1A5, with TSPYL1, NAMPT, CMTM7 and SPATS2L following behind.
+
+#### Training on top 10 features for the new model with optimized hyper-parameters
+
+We run the new RF on the top 10 most discriminative features to justify appropriateness.
+
+```{r}
+dataTrain_topfeat2 = dataTrain[,rfFeatures2]
+dataTest_topfeat2 = dataTest[,rfFeatures2]
+rfFit2_topfeat <- train(dataTrain_topfeat2, classTrain,
+                       method="rf",
+                       ntree=200,
+                       tuneLength=10,
+                       trControl=train_ctrl)
+rfFit2_topfeat
+```
+
+Accuracy and kappa peak at mtry = 2. 
+
+```{r}
+test_pred2 <- predict(rfFit2_topfeat, dataTest_topfeat2)
+confusionMatrix(test_pred2, classTest)
+```
+
+Looking at the confusion matrix, we can see a worse result compared to training the full data set as seen before. Overall, accuracy and kappa metrics are slightly higher when ntree is optimized compared to using default hyper-parameters. 
+
+A summary of the two RF models is outlined below. 
+
+```{r}
+resamps <- resamples(list(RF1 = rfFit, RF2 = rfFit2))
+summary(resamps)
+```
+
+From here, we can see the the second model is marginally preferable to the first model.
+
+## Support Vector Machines (SVMs)
+
+Support vector machines (SVMs) are models of supervised learning; they find a hyperplane in an N-dimensional space(where N is the number of features) that distinctly classifies the data points. After following a similar pre-processing procedure as RF, cross-validation is set up.
+
+```{r}
+set.seed(42)
+seeds2 <- vector(mode = "list", length = 11)
+for(i in 1:10) seeds2[[i]] <- sample.int(1000, 75) 
+seeds2[[11]] <- sample.int(1000,1)
+
+train_ctrl_svm <- trainControl(method="cv",
+                               number = 10,
+                               preProcOptions=list(cutoff=0.75),
+                               seeds = seeds2)
+```
+
+### SVM: default hyper-parameters
+
+The two main aspects to take into consideration for the SVM is the kernel and the value of the c paramater. The default hyper-parameters for SVMs (when using the svm() function, for example) usually involves radial kernel with cost 1. Tune length was limited to 5 to keep the run-time low.
+
+```{r}
+R_models <- train(dataTrain, classTrain,
+                  method="svmRadial",
+                  preProcess = c("center", "scale"),
+                  tuneLength=5,
+                  trControl=train_ctrl_svm)
+```
+
+### SVM: alternative hyper-parameters 
+
+Alternative hyper-parameters for SVMs involve different kernels i.e., linear and polynomial, and different c levels.
+
+```{r}
+L_models <- train(dataTrain, classTrain,
+                  method="svmLinear",
+                  preProcess = c("center", "scale"),
+                  tuneLength=5,
+                  trControl=train_ctrl_svm)
+
+P_models <- train(dataTrain, classTrain,
+                  method="svmPoly",
+                  preProcess = c("center", "scale"),
+                  tuneLength=5,
+                  trControl=train_ctrl_svm)
+```
+
+We can view a summary of the different SVM models in terms of accuracy and kappa metrics. 
+
+```{r}
+resamps <- resamples(list(Linear = L_models, Poly = P_models, Radial = R_models))
+summary(resamps)
+```
+
+All the models are achieving a maximum accuracy rate of 0.97, which is quite good.
+
+We can also view the summary in the form of a box plot. 
+
+```{r}
+bwplot(resamps, metric = "Accuracy")
+```
+
+The median value for the linear SVM is much lower than the polynomial and radial SVMs. The overall distribution for the linear SVM is also lower than the other two; therefore, we can exclude the linear kernel. The interquartile range for the polynomial kernel covers higher accuracy points compared to the radial kernel. The boxplot distribution assumes a unimodal distribution, however. The density plot can help with this.
+
+```{r}
+densityplot(resamps, metric = "Accuracy",auto.key=TRUE)
+```
+
+The radial kernel seems to show a slightly bimodal distribution, which may signify that for approximately half the cases, there is a lower accuracy rate, and a higher rate for the other half; this signifies instability. Therefore, the polynomial model seems the most appropriate kernel choice for the SVM.
+
+```{r}
+test_pred <- predict(P_models, dataTest)
+confusionMatrix(test_pred, classTest)
+```
+
+The confusion matrix has yielded good predictions, and sensitivity and specificity values are quite high. Accuracy on test and training data are both at approximately 0.90, which is a good sign.
+
+### SVM: discriminative features
+
+```{r}
+svmFeat = varImp(P_models)$importance
+svmFeatures = head(rownames(svmFeat[order(-rowSums(svmFeat)),]),10)
+print(svmFeatures)
+```
+
+We observe a few of the same discriminative features as identified by RF, including TSPYL1, NAMPT, SLC1A5, CMTM7.
+
+#### Training SVM on top 10 discriminative features
+
+We train with the polynomial kernel, due to previous justification.
+
+```{r}
+dataTrain_topfeat = dataTrain[,svmFeatures]
+dataTest_topfeat = dataTest[,svmFeatures]
+P_models_topfeat <- train(dataTrain_topfeat, classTrain,
+                          method="svmPoly",
+                          tuneLength=5,
+                          trControl=train_ctrl_svm)
+P_models_topfeat
+```
+
+Maximum accuracy is achieved at c = 4, degree = 3, where accuracy is 0.76 and kappa is 0.63. However, similar values are achieved with slightly tighter c values and smaller degree values; we could use the keep-it-simple rule and choose the smaller values. However, for this model, c is kept at 4. This is shown graphically below:
+
+```{r}
+plot(P_models_topfeat)
+```
+
+At all degrees, c = 4 indicated the highest accuracy.
+
+```{r}
+test_pred <- predict(P_models_topfeat, dataTest_topfeat)
+confusionMatrix(test_pred, classTest)
+```
+
+On the test data set with only the top 10 features, our accuracy drops quite a bit (to 0.70) which is disappointing. There is a drop in sensitivity and specificity values for class 1 and class 3. When we try to exclude some features, we seem to be diminishing some of the discriminative power of the model; this indicates that more signal into the model would allow us to achieve better accuracy, specificity and sensitivity.
+
+# Discussion
+
+## Summary of discriminative features
+
+Using the chosen RF model, the top 10 discriminative features are:
+
+```{r echo=FALSE}
+print(rfFeatures2)
+```
+
+Using the SVM model with polynomial kernel, the top 10 discriminative features are:
+
+```{r echo=FALSE}
+print(svmFeatures)
+```
+
+Below, we have an upset plot that identifies which features are found in common between the two methods. This is a summary of most of the biological signals present in the data.
+
+```{r}
+feature.list = list('rf'=rfFeatures2,'svm'=svmFeatures)
+print(upset(fromList(feature.list)))
+```
+
+From the above plot, we see that while the two methods identified 6 common features, they both exclusively identified four features.
+Below is the list of discriminative features found in common between the two classification methods:
+
+```{r echo=FALSE}
+print(intersect(rfFeatures2,svmFeatures))
+```
+
+## Comparison of the classification methods
+
+We can compare the accuracy of the two models. 
+
+```{r}
+resamps <- resamples(list(RF = rfFit2, SVM_poly = P_models))
+summary(resamps)
+```
+
+The two models seem very similar in terms of the variation in accuracy and Kappa.
+
+```{r}
+resamps.df = as.data.frame(resamps)
+resamps.df.melt = reshape2::melt(resamps.df,id_vars=c('Resample'))
+
+ggplot(resamps.df.melt,aes(x=variable,y=value,color=variable))+geom_boxplot()
+```
+
+When we look at the two models as a boxplot, we can see that the median values and interquartile ranges again are very similar.Given that the two methods are very similar in terms of metrics, we can look at some inherent problems and merits of the two. Random Forests inherit problems from decision trees, such as being stuck in local maxima. SVMs, as a method, have higher scalability and increased robustness, and therefore, from a supervised angle, I would choose the SVM as a classification method.
+
+## Clustering 
+
+We perform k-means clustering (which is a distance-based clustering method) to uncover some structure from the dataset. We wish to observe whether the clusters in the datasets correspond to the type of cell. Here, the rows correspond to observations and columns to features.
+
+```{r}
+kmeanscuomo <- kmeans(cuomoData, centers = 3, nstart = 20, iter.max = 50)
+
+# setting up the annotation row to show both the original and kmeans clusters
+annotationRow <- data.frame(kmeansClusters = factor(kmeanscuomo$cluster), 
+                            type = factor(cuomo$type))
+rownames(annotationRow) <- rownames(cuomoData) 
+
+pheatmap(cuomoData, annotation_row = annotationRow, show_colnames = F, 
+         show_rownames = F, scale = "column", 
+         color = colorRampPalette(colors = c("red", "white", "blue"))(100))
+```
+
+When we compare the kmeans clusters, data and type labels on a heatmap, we can see a reasonable, but not entirely perfect, visual match between the clusters and types. K-means, while relatively fast and scalable, requires the number of clusters to be selected beforehand. It can perform poorly if there are too many outliers.
+
+## Advantages and limitations of the information presented in the original matrix of expression
+
+In the original matrix of expression, the rows have identifiers of cells and the columns have identifiers corresponding to genes. Both a subset of cells and a subset of genes have been chosen from the Cuomo data set to apply classification methods (i.e., only three donors, and three types of cells). Expanding the dataset to include more donors may result in differences in identifying discriminative features. 
+
+An advantage of the original matrix is that the numeric features are normalized (therefore, very different values within the same feature can be compared easily). However, since individual gene expressions are presented on different scales, scaling and centering is required in analysis.
+
+The dataset has a large input of features: perhaps, dimensionality reduction via principal component analysis or a non-linear dimensionality reduction method (such as tSNE) can help separate out clusters and provide robustness to biological interpretations. 
+
+
+
